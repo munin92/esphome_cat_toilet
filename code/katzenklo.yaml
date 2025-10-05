@@ -1,0 +1,632 @@
+esphome:
+  name: katzenklo
+  friendly_name: katzenklo
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP_TASK_WDT: "y"
+      CONFIG_ESP_TASK_WDT_TIMEOUT_S: "30"
+
+logger:
+  level: DEBUG
+
+api:
+  encryption:
+    key: "CHANGE_ME"
+
+ota:
+  - platform: esphome
+    password: "CHANGE_ME"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  ap:
+    ssid: !secret wifi_ssid_fallback
+    password: !secret wifi_password_fallback
+
+captive_portal:
+
+# -------------------- Globals --------------------
+globals:
+  # Weight math (Arduino-like; tare in "units")
+  - id: calibration_factor
+    type: float
+    initial_value: '4500.0'
+  - id: amplification
+    type: float
+    initial_value: '120.0'
+  - id: cal_sign
+    type: float
+    initial_value: '-1.0'       # counts go DOWN with added weight
+
+  - id: tare_units
+    type: float
+    initial_value: '0.0'
+  - id: tare_request
+    type: bool
+    initial_value: 'true'        # capture tare on first sample
+
+  # Presence & cleaning
+  - id: cat_present
+    type: bool
+    initial_value: 'false'
+  - id: cleaning_pending
+    type: bool
+    initial_value: 'false'
+  - id: cleaning_in_progress
+    type: bool
+    initial_value: 'false'
+  - id: leave_time_ms
+    type: uint32_t
+    initial_value: '0'
+
+  # Thresholds & delays
+  - id: threshold_kg
+    type: float
+    initial_value: '1.5'
+  - id: cleaning_delay_ms
+    type: uint32_t
+    initial_value: '10000'
+
+  # Auto-pause/resume
+  - id: cat_interrupt_active
+    type: bool
+    initial_value: 'false'
+  - id: cat_resume_delay_ms
+    type: uint32_t
+    initial_value: '3000'        # cat must be out this long before homing resumes
+  - id: motor_stop_request
+    type: bool
+    initial_value: 'false'       # set when we need an immediate brake+off
+
+  # Boot / homing
+  - id: system_ready
+    type: bool
+    initial_value: 'false'
+  - id: boot_state               # 0 init, 1 start home, 2 homing, 3 tare, 4 ready
+    type: int
+    initial_value: '0'
+  - id: home_search_step         # 1..10
+    type: int
+    initial_value: '0'
+  - id: home_forward
+    type: bool
+    initial_value: 'true'
+  - id: home_step_started_at
+    type: uint32_t
+    initial_value: '0'
+  - id: home_step_active
+    type: bool
+    initial_value: 'false'
+
+  # Motor
+  - id: motor_running
+    type: bool
+    initial_value: 'false'
+  - id: motor_direction          # 1=fwd, -1=rev, 0=stop
+    type: int
+    initial_value: '0'
+  - id: motor_power_pct          # 0..1
+    type: float
+    initial_value: '1.0'
+  - id: motor_start_time
+    type: uint32_t
+    initial_value: '0'
+  - id: motor_max_run_ms
+    type: uint32_t
+    initial_value: '15000'
+
+  # UX
+  - id: last_error
+    type: std::string
+    initial_value: ""
+  - id: needs_attention
+    type: bool
+    initial_value: 'false'
+
+  # Direction inversion
+  - id: invert_motor_dir
+    type: bool
+    initial_value: 'true'
+
+# -------------------- Hall (Magnet) sensor --------------------
+binary_sensor:
+  - platform: gpio
+    id: hall_home
+    name: "Home Position"
+    pin:
+      number: GPIO4
+      mode: INPUT_PULLUP
+      inverted: true
+    filters:
+      - delayed_off: 50ms
+
+  - platform: template
+    name: "Cat Present"
+    lambda: |-
+      return id(cat_present);
+
+  - platform: template
+    name: "System Ready"
+    lambda: |-
+      return id(system_ready);
+
+  - platform: template
+    name: "Needs Attention"
+    lambda: |-
+      return id(needs_attention);
+
+# -------------------- HX711 --------------------
+sensor:
+  - platform: hx711
+    id: hx_raw
+    name: "Cat Weight"
+    dout_pin: GPIO22
+    clk_pin:  GPIO21
+    gain: 128
+    update_interval: 1s
+    accuracy_decimals: 1
+    unit_of_measurement: "kg"
+    filters:
+      - filter_out: 0.0
+      - sliding_window_moving_average:
+          window_size: 10
+          send_every: 1
+      - lambda: |-
+          float raw = x;
+          if (!std::isfinite(raw)) return id(hx_raw).state;
+
+          // counts -> units (signed)
+          float units = (raw / id(calibration_factor)) * id(cal_sign);
+
+          // capture tare on next fresh sample
+          if (id(tare_request)) {
+            id(tare_units) = units;
+            id(tare_request) = false;
+            ESP_LOGI("scale", "Captured tare_units=%.3f", id(tare_units));
+          }
+
+          // units -> kg
+          float kg = ((units - id(tare_units)) * id(amplification)) / 1000.0f;
+          if (kg < 0.0f) kg = 0.0f;
+          kg = roundf(kg * 10.0f) / 10.0f;  // 0.1 kg
+          return kg;
+
+    on_value:
+      then:
+        - lambda: |-
+            const float kg = x;
+            const uint32_t now = millis();
+
+            // detect cat presence (enter)
+            if (!id(cat_present) && kg > id(threshold_kg)) {
+              id(cat_present) = true;
+              id(leave_time_ms) = 0;
+              ESP_LOGI("klo", "Cat detected (%.1f kg)", kg);
+
+              // Auto-stop if anything is moving (cleaning/homing/manual)
+              if (id(cleaning_in_progress) || id(home_search_step) > 0 || id(motor_running)) {
+                id(motor_running) = false;
+                id(motor_direction) = 0;
+                id(cleaning_in_progress) = false;
+                id(home_search_step) = 0;
+                id(home_step_active) = false;
+                id(cat_interrupt_active) = true;
+                id(motor_stop_request) = true;   // request immediate brake
+                id(last_error) = "Paused: cat entered";
+                id(needs_attention) = false;
+                id(tare_request) = false;
+                ESP_LOGW("klo", "AUTO-PAUSE: Cat entered -> stop requested");
+              }
+            }
+
+            // track leave timing (cat exits)
+            if (id(cat_present) && kg < id(threshold_kg)) {
+              if (id(leave_time_ms) == 0) {
+                id(leave_time_ms) = now;
+                ESP_LOGI("klo", "Cat left, timing...");
+              }
+              if (id(cat_interrupt_active) && (now - id(leave_time_ms) > id(cat_resume_delay_ms))) {
+                // Resume homing only (safer than resuming clean)
+                ESP_LOGI("klo", "Cat away -> resume HOMING");
+                id(cat_present) = false;
+                id(cat_interrupt_active) = false;
+                id(home_search_step) = 1;
+                id(home_forward) = true;
+                id(home_step_active) = false;
+                id(leave_time_ms) = 0;
+                id(tare_request) = true;      // tare after homing completes
+              }
+            } else if (id(cat_present) && kg >= id(threshold_kg)) {
+              id(leave_time_ms) = 0;          // still inside
+            }
+
+            // Normal cleaning trigger (only when not in interrupt pause)
+            if (!id(cat_interrupt_active)) {
+              if (!id(cat_present) && id(leave_time_ms) > 0) {
+                if (now - id(leave_time_ms) > id(cleaning_delay_ms)) {
+                  id(cleaning_pending) = true;
+                  id(leave_time_ms) = 0;
+                  ESP_LOGI("klo", "Starting cleaning after delay...");
+                }
+              }
+            }
+
+        # If we requested a motor stop in the lambda, perform it here (YAML action)
+        - if:
+            condition:
+              lambda: 'return id(motor_stop_request);'
+            then:
+              - fan.hbridge.brake: drum_motor
+              - fan.turn_off: drum_motor
+              - lambda: |-
+                  id(motor_stop_request) = false;
+                  ESP_LOGW("klo", "Motor STOPPED (brake)");
+
+  - platform: template
+    name: "Cleaning Countdown"
+    unit_of_measurement: "s"
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      if (id(leave_time_ms) > 0) {
+        uint32_t elapsed = millis() - id(leave_time_ms);
+        if (elapsed < id(cleaning_delay_ms)) {
+          return (id(cleaning_delay_ms) - elapsed) / 1000.0f;
+        }
+      }
+      return 0.0f;
+
+  - platform: template
+    name: "Motor Power (%) (RO)"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: |-
+      return id(motor_power_pct) * 100.0f;
+
+text_sensor:
+  - platform: template
+    name: "System Status"
+    update_interval: 1s
+    lambda: |-
+      if (id(last_error).size()) {
+        return std::string("⚠ ") + id(last_error);
+      }
+      switch (id(boot_state)) {
+        case 0: return std::string("Boot: init");
+        case 1: return std::string("Boot: start home");
+        case 2: return std::string("Boot: homing...");
+        case 3: return std::string("Boot: tare");
+        case 4: default: break;
+      }
+      if (id(cleaning_in_progress)) return std::string("Cleaning");
+      if (id(cat_present)) return std::string("Cat (") + to_string(id(hx_raw).state) + " kg)";
+      if (id(leave_time_ms) > 0) {
+        uint32_t remaining = (id(cleaning_delay_ms) - (millis() - id(leave_time_ms))) / 1000;
+        return std::string("Cleaning in ") + to_string(remaining) + "s";
+      }
+      if (!id(system_ready)) return std::string("Starting...");
+      return std::string("Ready");
+
+# -------------------- L298N (H-Bridge) --------------------
+output:
+  - platform: ledc
+    pin: GPIO27
+    id: out_in1
+    frequency: 1000Hz
+  - platform: ledc
+    pin: GPIO26
+    id: out_in2
+    frequency: 1000Hz
+  - platform: ledc
+    pin: GPIO32
+    id: out_ena
+    frequency: 1000Hz
+
+fan:
+  - platform: hbridge
+    id: drum_motor
+    name: "Drum Motor"
+    pin_a: out_in1
+    pin_b: out_in2
+    enable_pin: out_ena        # remove ENA jumper
+    decay_mode: fast
+    speed_count: 100
+
+# -------------------- Direction flip switch --------------------
+switch:
+  - platform: template
+    name: "Invert Motor Direction"
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - lambda: |-
+          id(invert_motor_dir) = true;
+          ESP_LOGI("motor", "Direction inverted");
+    turn_off_action:
+      - lambda: |-
+          id(invert_motor_dir) = false;
+          ESP_LOGI("motor", "Direction normal");
+
+# -------------------- Buttons & Numbers --------------------
+button:
+  - platform: template
+    name: "Calibrate (Tare)"
+    on_press:
+      - lambda: |-
+          id(tare_request) = true;
+          ESP_LOGI("scale", "Tare requested (next sample)");
+
+  - platform: template
+    name: "Manual Cleaning"
+    on_press:
+      - if:
+          condition:
+            and:
+              - lambda: return !id(cleaning_in_progress);
+              - lambda: return id(system_ready);
+              - lambda: return !id(cat_present);
+              - lambda: return !id(cat_interrupt_active);
+          then:
+            - lambda: |-
+                id(cleaning_pending) = true;
+                ESP_LOGI("klo", "Manual cleaning scheduled.");
+          else:
+            - lambda: |-
+                ESP_LOGW("klo", "Cannot clean now. ready=%d in_progress=%d cat=%d paused=%d",
+                         id(system_ready), id(cleaning_in_progress), id(cat_present), id(cat_interrupt_active));
+
+  - platform: template
+    name: "Emergency Stop"
+    on_press:
+      - lambda: |-
+          id(cleaning_in_progress) = false;
+          id(cleaning_pending) = false;
+          id(home_search_step) = 0;
+          id(home_step_active) = false;
+          id(cat_interrupt_active) = false;
+      - fan.hbridge.brake: drum_motor
+      - fan.turn_off: drum_motor
+      - lambda: |-
+          id(last_error) = "Emergency stop";
+          id(needs_attention) = true;
+          id(motor_running) = false;
+          id(motor_direction) = 0;
+
+number:
+  - platform: template
+    name: "Threshold (kg)"
+    min_value: 0.5
+    max_value: 10.0
+    step: 0.1
+    unit_of_measurement: "kg"
+    optimistic: true
+    restore_value: true
+    initial_value: 1.5
+    on_value:
+      then:
+        - lambda: id(threshold_kg) = x;
+
+  - platform: template
+    name: "Cleaning Delay (s)"
+    min_value: 5
+    max_value: 120
+    step: 1
+    unit_of_measurement: "s"
+    optimistic: true
+    restore_value: true
+    initial_value: 10
+    on_value:
+      then:
+        - lambda: id(cleaning_delay_ms) = (uint32_t)(x * 1000.0f);
+
+  - platform: template
+    name: "Motor Power (%)"
+    min_value: 30
+    max_value: 100
+    step: 5
+    optimistic: true
+    restore_value: true
+    initial_value: 100
+    on_value:
+      then:
+        - lambda: id(motor_power_pct) = x / 100.0f;
+
+# -------------------- Scripts --------------------
+script:
+  - id: motor_stop
+    then:
+      - fan.hbridge.brake: drum_motor
+      - fan.turn_off: drum_motor
+      - lambda: |-
+          id(motor_running) = false;
+          id(motor_direction) = 0;
+
+  - id: motor_forward
+    then:
+      - if:
+          condition:
+            lambda: 'return id(invert_motor_dir);'
+          then:
+            - fan.turn_on:
+                id: drum_motor
+                speed: !lambda "return (int) (id(motor_power_pct) * 100.0f);"
+                direction: REVERSE
+          else:
+            - fan.turn_on:
+                id: drum_motor
+                speed: !lambda "return (int) (id(motor_power_pct) * 100.0f);"
+                direction: FORWARD
+      - lambda: |-
+          id(motor_running) = true;
+          id(motor_direction) = id(invert_motor_dir) ? -1 : 1;
+          id(motor_start_time) = millis();
+
+  - id: motor_reverse
+    then:
+      - if:
+          condition:
+            lambda: 'return id(invert_motor_dir);'
+          then:
+            - fan.turn_on:
+                id: drum_motor
+                speed: !lambda "return (int) (id(motor_power_pct) * 100.0f);"
+                direction: FORWARD
+          else:
+            - fan.turn_on:
+                id: drum_motor
+                speed: !lambda "return (int) (id(motor_power_pct) * 100.0f);"
+                direction: REVERSE
+      - lambda: |-
+          id(motor_running) = true;
+          id(motor_direction) = id(invert_motor_dir) ? 1 : -1;
+          id(motor_start_time) = millis();
+
+  - id: cleaning_cycle
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(cleaning_in_progress);
+          then:
+            - script.stop: cleaning_cycle
+
+      - lambda: |-
+          id(cleaning_in_progress) = true;
+          id(cleaning_pending) = false;
+          ESP_LOGI("klo", "Cleaning: reverse 7s");
+      - script.execute: motor_reverse
+      - delay: 7s
+
+      - script.execute: motor_stop
+      - delay: 2s
+
+      - lambda: |-
+          ESP_LOGI("klo", "Cleaning: forward 9s");
+      - script.execute: motor_forward
+      - delay: 9s
+
+      - script.execute: motor_stop
+      - delay: 2s
+
+      # Start homing; tare after homing
+      - lambda: |-
+          ESP_LOGI("klo", "Cleaning: start homing");
+          id(home_search_step) = 1;
+          id(home_forward) = true;
+          id(home_step_active) = false;
+          id(tare_request) = true;
+
+      - lambda: |-
+          id(cleaning_in_progress) = false;
+          ESP_LOGI("klo", "Cleaning completed, tare requested");
+
+# -------------------- Intervals --------------------
+interval:
+  # Motor watchdog
+  - interval: 250ms
+    then:
+      - lambda: |-
+          if (id(motor_running)) {
+            uint32_t now = millis();
+            if (now - id(motor_start_time) > id(motor_max_run_ms)) {
+              id(motor_stop).execute();
+              id(last_error) = "Motor watchdog timeout";
+              id(needs_attention) = true;
+              id(cleaning_in_progress) = false;
+              id(cleaning_pending) = false;
+              ESP_LOGE("klo", "Motor watchdog timeout -> STOP");
+            }
+          }
+
+  # Homing (rocking 1..10 s)
+  - interval: 100ms
+    then:
+      - lambda: |-
+          if (id(home_search_step) == 0) return;
+          uint32_t now = millis();
+
+          // sensor hit -> stop and finish homing
+          if (id(hall_home).state) {
+            id(motor_stop).execute();
+            id(home_search_step) = 0;
+            id(home_step_active) = false;
+            ESP_LOGI("klo", "Home position found.");
+            if (id(boot_state) == 2) id(boot_state) = 3;
+            return;
+          }
+
+          uint32_t step_ms = (uint32_t) (id(home_search_step) * 1000U);
+
+          if (!id(home_step_active)) {
+            if (id(home_forward)) {
+              id(motor_forward).execute();
+              ESP_LOGI("klo", "Homing step %d: FORWARD %ds", id(home_search_step), id(home_search_step));
+            } else {
+              id(motor_reverse).execute();
+              ESP_LOGI("klo", "Homing step %d: REVERSE %ds", id(home_search_step), id(home_search_step));
+            }
+            id(home_step_started_at) = now;
+            id(home_step_active) = true;
+          } else {
+            if (now - id(home_step_started_at) >= step_ms) {
+              id(motor_stop).execute();
+              id(home_search_step)++;
+              id(home_forward) = !id(home_forward);
+              id(home_step_active) = false;
+              if (id(home_search_step) > 10) {
+                id(home_search_step) = 0;
+                id(last_error) = "Home search failed";
+                id(needs_attention) = true;
+                ESP_LOGW("klo", "Home search failed.");
+                if (id(boot_state) == 2) id(boot_state) = 3;
+              }
+            }
+          }
+
+  # Boot state machine
+  - interval: 500ms
+    then:
+      - lambda: |-
+          switch (id(boot_state)) {
+            case 0:
+              ESP_LOGI("klo", "Boot: init");
+              id(boot_state) = 1;
+              break;
+            case 1:
+              ESP_LOGI("klo", "Boot: start homing");
+              id(home_search_step) = 1;
+              id(home_forward) = true;
+              id(home_step_active) = false;
+              id(boot_state) = 2;
+              break;
+            case 2:
+              break;
+            case 3:
+              id(tare_request) = true;  // capture tare on next sample
+              id(system_ready) = true;
+              id(boot_state) = 4;
+              ESP_LOGI("klo", "Boot: tare requested; system ready");
+              break;
+            default:
+              break;
+          }
+
+  # Trigger cleaning when pending (not during cat interrupt)
+  - interval: 1s
+    then:
+      - if:
+          condition:
+            and:
+              - lambda: return id(cleaning_pending);
+              - lambda: return !id(cleaning_in_progress);
+              - lambda: return !id(cat_present);
+              - lambda: return !id(cat_interrupt_active);
+              - lambda: return id(system_ready);
+          then:
+            - script.execute: cleaning_cycle
