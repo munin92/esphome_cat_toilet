@@ -39,7 +39,7 @@ globals:
     initial_value: '4500.0'
   - id: amplification
     type: float
-    initial_value: '120.0'
+    initial_value: '180.0'
   - id: cal_sign
     type: float
     initial_value: '-1.0'       # counts go DOWN with added weight
@@ -203,13 +203,13 @@ sensor:
             const float kg = x;
             const uint32_t now = millis();
 
-            // detect cat presence (enter)
+            // --- Cat enters ---
             if (!id(cat_present) && kg > id(threshold_kg)) {
               id(cat_present) = true;
               id(leave_time_ms) = 0;
               ESP_LOGI("klo", "Cat detected (%.1f kg)", kg);
 
-              // Auto-stop if anything is moving (cleaning/homing/manual)
+              // Auto-stop anything moving
               if (id(cleaning_in_progress) || id(home_search_step) > 0 || id(motor_running)) {
                 id(motor_running) = false;
                 id(motor_direction) = 0;
@@ -217,7 +217,7 @@ sensor:
                 id(home_search_step) = 0;
                 id(home_step_active) = false;
                 id(cat_interrupt_active) = true;
-                id(motor_stop_request) = true;   // request immediate brake
+                id(motor_stop_request) = true;
                 id(last_error) = "Paused: cat entered";
                 id(needs_attention) = false;
                 id(tare_request) = false;
@@ -225,28 +225,23 @@ sensor:
               }
             }
 
-            // track leave timing (cat exits)
-            if (id(cat_present) && kg < id(threshold_kg)) {
+            // --- Cat leaves (with hysteresis) ---
+            const float exit_threshold = id(threshold_kg) * 0.8f;  // 20% lower than entry
+            if (id(cat_present) && kg < exit_threshold) {
               if (id(leave_time_ms) == 0) {
                 id(leave_time_ms) = now;
-                ESP_LOGI("klo", "Cat left, timing...");
-              }
-              if (id(cat_interrupt_active) && (now - id(leave_time_ms) > id(cat_resume_delay_ms))) {
-                // Resume homing only (safer than resuming clean)
-                ESP_LOGI("klo", "Cat away -> resume HOMING");
+                ESP_LOGI("klo", "Cat below exit threshold, timing...");
+              } else if (now - id(leave_time_ms) > 1500) {  // stable 1.5s below threshold
                 id(cat_present) = false;
                 id(cat_interrupt_active) = false;
-                id(home_search_step) = 1;
-                id(home_forward) = true;
-                id(home_step_active) = false;
-                id(leave_time_ms) = 0;
-                id(tare_request) = true;      // tare after homing completes
+                ESP_LOGI("klo", "Cat marked as OUT");
+                id(leave_time_ms) = now;  // start cleaning delay timer
               }
-            } else if (id(cat_present) && kg >= id(threshold_kg)) {
-              id(leave_time_ms) = 0;          // still inside
+            } else if (kg >= exit_threshold) {
+              id(leave_time_ms) = 0;  // still in or bouncing
             }
 
-            // Normal cleaning trigger (only when not in interrupt pause)
+            // --- Start cleaning after delay ---
             if (!id(cat_interrupt_active)) {
               if (!id(cat_present) && id(leave_time_ms) > 0) {
                 if (now - id(leave_time_ms) > id(cleaning_delay_ms)) {
@@ -257,7 +252,7 @@ sensor:
               }
             }
 
-        # If we requested a motor stop in the lambda, perform it here (YAML action)
+        # immediate motor stop if requested
         - if:
             condition:
               lambda: 'return id(motor_stop_request);'
@@ -390,13 +385,15 @@ button:
           id(home_search_step) = 0;
           id(home_step_active) = false;
           id(cat_interrupt_active) = false;
+          id(leave_time_ms) = 0;  // Reset cleaning countdown
       - fan.hbridge.brake: drum_motor
       - fan.turn_off: drum_motor
       - lambda: |-
-          id(last_error) = "Emergency stop";
-          id(needs_attention) = true;
+          id(last_error) = "";  // Clear error immediately
+          id(needs_attention) = false;
           id(motor_running) = false;
           id(motor_direction) = 0;
+          ESP_LOGI("klo", "Emergency stop - returning to normal operation");
 
 number:
   - platform: template
